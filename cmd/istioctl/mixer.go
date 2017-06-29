@@ -21,7 +21,6 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 
 	"istio.io/pilot/client/proxy"
@@ -45,11 +44,10 @@ const (
 )
 
 var (
-	mixerFile            string
-	mixerFileContent     []byte
-	mixerAPIServerAddr   string // deprecated
-	istioMixerAPIService string
-	mixerRESTRequester   proxy.RESTRequester
+	mixerFile             string
+	mixerFileContent      []byte
+	istioGalleyAPIService string
+	mixerRESTRequester    proxy.RESTRequester
 
 	mixerCmd = &cobra.Command{
 		Use:   "mixer",
@@ -79,11 +77,11 @@ for a description of Mixer configuration's scope, subject, and rules.
 				mixerRESTRequester = &k8sRESTRequester{
 					client:    client,
 					namespace: istioNamespace,
-					service:   istioMixerAPIService,
+					service:   istioGalleyAPIService,
 				}
 			} else {
 				mixerRESTRequester = &proxy.BasicHTTPRequester{
-					BaseURL: istioMixerAPIService,
+					BaseURL: istioGalleyAPIService,
 					Client:  &http.Client{Timeout: requestTimeout},
 					Version: kube.IstioResourceVersion,
 				}
@@ -231,11 +229,11 @@ func mixerGet(path string) (string, error) {
 		return "", errors.New(http.StatusText(status))
 	}
 
-	var response mixerAPIResponse
+	response := map[string]interface{}{}
 	if err = json.Unmarshal(body, &response); err != nil {
 		return "", fmt.Errorf("failed processing response: %v", err)
 	}
-	data, err := yaml.Marshal(response.Data)
+	data, err := yaml.Marshal(response["source_data"])
 	if err != nil {
 		return "", fmt.Errorf("failed formatting response: %v", err)
 	}
@@ -247,10 +245,14 @@ func mixerRequest(method, path string, reqBody []byte) error {
 
 	// If we got output, let's look at it, even if we got an error.  The output might include the reason for the error.
 	if respBody != nil {
-		var response mixerAPIResponse
+		response := map[string]interface{}{}
 		message := "unknown"
+		fmt.Printf("%s\n", respBody)
 		if errJSON := json.Unmarshal(respBody, &response); errJSON == nil {
-			message = response.Status.Message
+			status := response["status"].(map[string]interface{})
+			if msg, ok := status["message"]; ok {
+				message = msg.(string)
+			}
 		}
 
 		if status != http.StatusOK {
@@ -264,11 +266,19 @@ func mixerRequest(method, path string, reqBody []byte) error {
 }
 
 func mixerRulePath(scope, subject string) string {
-	return scopesPath + fmt.Sprintf("%s/subjects/%s/rules", url.PathEscape(scope), url.PathEscape(subject))
+	return fmt.Sprintf("core/rules/v1/%s/%s", url.PathEscape(scope), url.PathEscape(subject))
 }
 
 func mixerRuleCreate(scope, subject string, rule []byte) error {
-	return mixerRequest(http.MethodPut, mixerRulePath(scope, subject), rule)
+	data := map[string]interface{}{}
+	if err := yaml.Unmarshal(rule, &data); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return mixerRequest(http.MethodPut, mixerRulePath(scope, subject), encoded)
 }
 
 func mixerRuleGet(scope, subject string) (string, error) {
@@ -280,12 +290,20 @@ func mixerRuleDelete(scope, subject string) error {
 }
 
 func mixerAdapterOrDescriptorPath(scope, name string) string {
-	return scopesPath + fmt.Sprintf("%s/%s", url.PathEscape(scope), url.PathEscape(name))
+	return fmt.Sprintf("core/%s/v1//%s", url.PathEscape(name), url.PathEscape(scope))
 }
 
 func mixerAdapterOrDescriptorCreate(scope, name string, config []byte) error {
 	path := mixerAdapterOrDescriptorPath(scope, name)
-	return mixerRequest(http.MethodPut, path, config)
+	data := map[string]interface{}{}
+	if err := yaml.Unmarshal(config, &data); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return mixerRequest(http.MethodPut, path, encoded)
 }
 
 func mixerAdapterOrDescriptorGet(scope, name string) (string, error) {
@@ -319,13 +337,9 @@ func init() {
 		"Input file with contents of the adapters config")
 	mixerDescriptorCmd.PersistentFlags().StringVarP(&mixerFile, "file", "f", "",
 		"Input file with contents of the descriptors config")
-	mixerCmd.PersistentFlags().StringVar(&istioMixerAPIService,
-		"mixerAPIService", "istio-mixer:9094",
+	mixerCmd.PersistentFlags().StringVar(&istioGalleyAPIService,
+		"galleyAPIServer", "istio-galley:9096",
 		"Name of istio-mixer service. When --kube=false this sets the address of the mixer service")
-	// TODO remove this flag once istio/istio integration tests are
-	// updated to use mixer service
-	mixerCmd.PersistentFlags().StringVar(&mixerAPIServerAddr, "mixer", os.Getenv("ISTIO_MIXER_API_SERVER"),
-		"(deprecated) Address of the Mixer configuration server as <host>:<port>")
 
 	mixerRuleCmd.AddCommand(mixerRuleCreateCmd)
 	mixerRuleCmd.AddCommand(mixerRuleGetCmd)
